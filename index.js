@@ -10,7 +10,7 @@ const app = express();
 ======================= */
 app.use(
   cors({
-    origin: "*", // allow all (safe for now)
+    origin: "*",
     methods: ["GET", "POST"],
   })
 );
@@ -38,15 +38,8 @@ const io = new Server(httpServer, {
 /* =======================
    IN-MEMORY STORAGE
 ======================= */
-
-// waiting users
-let waitingQueue = [];
-
-// socketId -> roomId
-const userRooms = new Map();
-
-// roomId -> messages[]
-const roomMessages = new Map();
+let waitingQueue = [];          // socketIds
+const userRooms = new Map();    // socketId -> roomId
 
 /* =======================
    HELPERS
@@ -62,78 +55,45 @@ io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
   broadcastUserCount();
 
-  /* ---- FIND PARTNER ---- */
+  /* ---- FIND STRANGER ---- */
   socket.on("find_partner", () => {
-    // remove self if already waiting
-    waitingQueue = waitingQueue.filter(
-      (u) => u.socketId !== socket.id
-    );
+    waitingQueue = waitingQueue.filter(id => id !== socket.id);
 
-    let partner = null;
+    let partnerId = waitingQueue.shift();
 
-    while (waitingQueue.length > 0) {
-      const candidate = waitingQueue.shift();
-      const candidateSocket = io.sockets.sockets.get(candidate.socketId);
-
-      if (candidateSocket && !candidateSocket.disconnected) {
-        partner = candidateSocket;
-        break;
-      }
-    }
-
-    if (partner) {
-      const roomId = [socket.id, partner.id].sort().join("_");
+    if (partnerId) {
+      const roomId = [socket.id, partnerId].sort().join("_");
 
       socket.join(roomId);
-      partner.join(roomId);
+      io.to(partnerId).socketsJoin(roomId);
 
       userRooms.set(socket.id, roomId);
-      userRooms.set(partner.id, roomId);
+      userRooms.set(partnerId, roomId);
 
-      // initialize messages if not exists
-      if (!roomMessages.has(roomId)) {
-        roomMessages.set(roomId, []);
-      }
+      socket.emit("match_found", { roomId, initiator: true });
+      io.to(partnerId).emit("match_found", { roomId, initiator: false });
 
-      const previousMessages = roomMessages.get(roomId);
-
-      socket.emit("match_found", { roomId, initiator: false });
-      partner.emit("match_found", { roomId, initiator: true });
-
-      socket.emit("previous_messages", previousMessages);
-      partner.emit("previous_messages", previousMessages);
-
-      console.log(`Matched ${socket.id} ↔ ${partner.id}`);
+      console.log(`Matched ${socket.id} ↔ ${partnerId}`);
     } else {
-      waitingQueue.push({ socketId: socket.id });
-      socket.emit("waiting", { message: "Looking for a match..." });
+      waitingQueue.push(socket.id);
+      socket.emit("waiting");
     }
   });
 
-  /* ---- MESSAGE ---- */
-  socket.on("message", (data) => {
-    const roomId = data.roomId;
-    if (!roomId) return;
+  /* =======================
+     🔥 WEBRTC SIGNALING
+  ======================= */
 
-    const message = {
-      sender: "Stranger",
-      text: data.text,
-      time: new Date().toLocaleTimeString([], {
-        hour: "2-digit",
-        minute: "2-digit",
-      }),
-    };
+  socket.on("webrtc_offer", ({ roomId, offer }) => {
+    socket.to(roomId).emit("webrtc_offer", offer);
+  });
 
-    if (!roomMessages.has(roomId)) {
-      roomMessages.set(roomId, []);
-    }
+  socket.on("webrtc_answer", ({ roomId, answer }) => {
+    socket.to(roomId).emit("webrtc_answer", answer);
+  });
 
-    roomMessages.get(roomId).push(message);
-
-    socket.to(roomId).emit("message", {
-      ...message,
-      type: "incoming",
-    });
+  socket.on("webrtc_ice_candidate", ({ roomId, candidate }) => {
+    socket.to(roomId).emit("webrtc_ice_candidate", candidate);
   });
 
   /* ---- LEAVE CHAT ---- */
@@ -145,27 +105,18 @@ io.on("connection", (socket) => {
 
     socket.leave(roomId);
     userRooms.delete(socket.id);
-    roomMessages.delete(roomId);
-  });
-
-  /* ---- USER COUNT ---- */
-  socket.on("request_user_count", () => {
-    socket.emit("user_count", io.engine.clientsCount);
   });
 
   /* ---- DISCONNECT ---- */
   socket.on("disconnect", () => {
     console.log("User disconnected:", socket.id);
 
-    waitingQueue = waitingQueue.filter(
-      (u) => u.socketId !== socket.id
-    );
+    waitingQueue = waitingQueue.filter(id => id !== socket.id);
 
     const roomId = userRooms.get(socket.id);
     if (roomId) {
       socket.to(roomId).emit("partner_disconnected");
       userRooms.delete(socket.id);
-      roomMessages.delete(roomId);
     }
 
     broadcastUserCount();
@@ -176,7 +127,6 @@ io.on("connection", (socket) => {
    START SERVER
 ======================= */
 const PORT = process.env.PORT || 5000;
-
 httpServer.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
